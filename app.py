@@ -326,8 +326,13 @@ def scrape_page(url: str) -> dict:
                     elements.append({"type": "image", "alt": alt})
 
             # ---- RECURSE INTO CONTAINERS ----
+            # tbody, tr, td, th added so layout tables are walked correctly —
+            # when is_layout_table() returns True, walk() recurses into the
+            # table tag, and needs to keep recursing through tbody > tr > td
+            # to reach the actual text content inside the cells.
             elif tag_name in ("div", "section", "main", "article", "figure",
-                              "details", "summary"):
+                              "details", "summary", "tbody", "tr", "td", "th",
+                              "thead", "tfoot"):
                 walk(child)
 
     walk(content_area)
