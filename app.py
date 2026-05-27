@@ -90,6 +90,57 @@ def clean_text(text: str) -> str:
     text = re.sub(r" {2,}", " ", text)
     return text.strip()
 
+def extract_table(table_tag) -> dict:
+    """
+    Converts a BeautifulSoup <table> tag into a structured dict.
+    Returns headers (from <th> cells) and rows (from <td> cells).
+    Handles colspan by repeating the cell text across spanned columns.
+    """
+    headers = []
+    rows    = []
+
+    # Extract header row from <thead> if it exists
+    thead = table_tag.find("thead")
+    if thead:
+        for th in thead.find_all("th"):
+            colspan   = int(th.get("colspan", 1))
+            cell_text = clean_text(th.get_text(separator=" ", strip=True))
+            headers.extend([cell_text] * colspan)
+        if not headers:
+            for td in thead.find_all("td"):
+                colspan   = int(td.get("colspan", 1))
+                cell_text = clean_text(td.get_text(separator=" ", strip=True))
+                headers.extend([cell_text] * colspan)
+
+    # Extract data rows from <tbody> (or whole table if no tbody)
+    tbody = table_tag.find("tbody") or table_tag
+    for tr in tbody.find_all("tr", recursive=False):
+        cells = tr.find_all(["td", "th"])
+        if not cells:
+            continue
+        row    = []
+        all_th = all(c.name == "th" for c in cells)
+        for cell in cells:
+            colspan   = int(cell.get("colspan", 1))
+            cell_text = clean_text(cell.get_text(separator=" ", strip=True))
+            row.extend([cell_text] * colspan)
+        if all_th and not headers:
+            headers = row
+        else:
+            if any(cell for cell in row):
+                rows.append(row)
+
+    col_count = max(
+        len(headers),
+        max((len(r) for r in rows), default=0)
+    )
+
+    return {
+        "type":      "table",
+        "headers":   headers,
+        "rows":      rows,
+        "col_count": col_count,
+    }
 
 def is_see_also_heading(text: str) -> bool:
     """
@@ -225,6 +276,13 @@ def scrape_page(url: str) -> dict:
                 if text:
                     elements.append({"type": "blockquote", "text": text})
 
+            # ---- TABLES ----
+            elif tag_name == "table":
+                table_data = extract_table(child)
+                if table_data["rows"] or table_data["headers"]:
+                    elements.append(table_data)
+
+            
             # ---- UNORDERED LISTS ----
             elif tag_name == "ul":
                 for li in child.find_all("li", recursive=False):
