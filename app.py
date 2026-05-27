@@ -114,6 +114,57 @@ def extract_table(table_tag) -> dict:
         - Merged cells (colspan) — cell content is repeated for each spanned column
         - Nested content — extracts all text from inside each cell
     """
+
+    def is_layout_table(table_tag) -> bool:
+    """
+    Returns True if a <table> is being used for page layout rather than data.
+
+    WHY THIS MATTERS:
+        GE Vernova docs (and many older documentation sites) use <table> tags
+        for two completely different purposes:
+          1. DATA tables  — parameter lists, field definitions, comparison grids
+          2. LAYOUT tables — positioning an image next to text, multi-column layouts
+
+        Data tables should become Word tables.
+        Layout tables should be transparently walked — extract their text and
+        images as normal elements, ignoring the table structure entirely.
+
+    SIGNALS THAT IT IS A LAYOUT TABLE:
+        - Contains <img> tags directly inside cells
+        - Has no <th> header cells anywhere
+        - Has only 2-3 columns
+        - Cells contain long paragraphs (over 200 chars) — data cells are short
+        - Has a summary="" attribute (old HTML convention for layout tables)
+        - Has role="presentation" attribute
+    """
+    # Explicit HTML attributes that declare layout intent
+    if table_tag.get("role") == "presentation":
+        return True
+    if table_tag.get("summary") == "":
+        return True
+
+    # If any cell directly contains an <img>, it's a layout table
+    for img in table_tag.find_all("img"):
+        return True
+
+    # If there are no <th> header cells at all, check cell content length
+    has_th = bool(table_tag.find("th"))
+    if not has_th:
+        cells = table_tag.find_all("td")
+        if cells:
+            # Calculate average text length across all cells
+            avg_len = sum(
+                len(c.get_text(strip=True)) for c in cells
+            ) / len(cells)
+            # Data table cells are short (field names, values).
+            # Layout table cells contain full paragraphs.
+            if avg_len > 200:
+                return True
+
+    return False
+
+    
+    
     headers = []
     rows    = []
 
@@ -333,15 +384,18 @@ def scrape_page(url: str) -> dict:
                 if text:
                     elements.append({"type": tag_name, "text": text})
 
-            # ---- TABLES (NEW IN v3) ----
-            # We intercept <table> tags BEFORE recursing, so we handle the
-            # whole table as one unit rather than falling into its cells
+           # ---- TABLES ----
             elif tag_name == "table":
-                table_data = extract_table(child)
-                # Only add the table if it has some actual content
-                if table_data["rows"] or table_data["headers"]:
-                    elements.append(table_data)
-                # Do NOT recurse into the table — extract_table() handled it
+                if is_layout_table(child):
+                    # Layout table — ignore the table structure entirely.
+                    # Recurse into it so images and text inside cells
+                    # are extracted as normal individual elements.
+                    walk(child)
+                else:
+                    # Data table — convert to a structured Word table.
+                    table_data = extract_table(child)
+                    if table_data["rows"] or table_data["headers"]:
+                        elements.append(table_data)
 
             # ---- PARAGRAPHS ----
             elif tag_name == "p":
