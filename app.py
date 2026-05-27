@@ -115,7 +115,7 @@ def extract_table(table_tag) -> dict:
         - Nested content — extracts all text from inside each cell
     """
 
-    def is_layout_table(table_tag) -> bool:
+def is_layout_table(table_tag) -> bool:
     """
     Returns True if a <table> is being used for page layout rather than data.
 
