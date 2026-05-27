@@ -144,7 +144,11 @@ def is_layout_table(table_tag) -> bool:
         return True
 
     # If any cell directly contains an <img>, it's a layout table
+    # We still recurse into it via walk() so the surrounding text is captured
+    # Images themselves are skipped entirely — no embedding attempted
     for img in table_tag.find_all("img"):
+        # Remove the img tags so they don't block text extraction
+        img.decompose()
         return True
 
     # If there are no <th> header cells at all, check cell content length
@@ -731,21 +735,16 @@ def build_word_document(pages: list, doc_title: str) -> io.BytesIO:
                          else "List Bullet")
                 doc.add_paragraph(elem["text"], style=style)
 
-            # ---- IMAGES (v3: WebP support via Pillow) ----
+            # ---- IMAGES — skipped for stability ----
+            # Image embedding causes layout tables to lose surrounding content.
+            # Images are logged as placeholder text only.
             elif etype == "image":
-                img_bytes, hint = fetch_image(elem["src"])
-                if img_bytes:
-                    img_stream = io.BytesIO(img_bytes)
-                    try:
-                        doc.add_picture(img_stream, width=Inches(5))
-                        if elem.get("alt") and elem["alt"] != "Image":
-                            cap = doc.add_paragraph(elem["alt"])
-                            if cap.runs:
-                                cap.runs[0].italic = True
-                                cap.runs[0].font.size = Pt(9)
-                                cap.runs[0].font.color.rgb = RGBColor(0x66, 0x66, 0x66)
-                    except Exception:
-                        pass
+                if elem.get("alt") and elem["alt"] not in ("Image", ""):
+                    note = doc.add_paragraph(f"[Image: {elem['alt']}]")
+                    if note.runs:
+                        note.runs[0].italic = True
+                        note.runs[0].font.size = Pt(9)
+                        note.runs[0].font.color.rgb = RGBColor(0x88, 0x88, 0x88)
 
             # ---- SVG PLACEHOLDER (NEW IN v3) ----
             elif etype == "svg":
