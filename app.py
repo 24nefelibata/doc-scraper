@@ -1,12 +1,6 @@
 # =============================================================================
 # app.py — Documentation Scraper & Word Document Generator
-# =============================================================================
-# VERSION 3 CHANGES:
-#   1. Full <table> support — reconstructed as real Word tables and aligned
-#      ASCII tables in plain text export (critical for AI accuracy)
-#   2. WebP image support — Pillow converts WebP → PNG before embedding
-#   3. SVG images logged as [SVG DIAGRAM] placeholder instead of silently skipped
-#   4. All v2 fixes retained (See Also stripping, unicode cleaning)
+# VERSION 4: Fixed function ordering + images skipped for stability
 # =============================================================================
 
 import streamlit as st
@@ -17,9 +11,6 @@ from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
-from docx.oxml.ns import nsdecls
-from docx.oxml import parse_xml
-from PIL import Image as PilImage   # Pillow — for WebP → PNG conversion
 import io
 import re
 import urllib3
@@ -54,7 +45,7 @@ st.divider()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =============================================================================
-# SECTION 2: CONSTANTS & TEXT CLEANING
+# SECTION 2: TEXT CLEANING
 # =============================================================================
 
 SEE_ALSO_PHRASES = [
@@ -65,19 +56,16 @@ SEE_ALSO_PHRASES = [
 ]
 
 def clean_text(text: str) -> str:
-    """
-    Strips unicode artefacts and normalises whitespace.
-    Handles the Â character common in GE Vernova docs (Latin-1/UTF-8 mismatch).
-    """
-    text = text.replace("\u00c2", "")    # Stray Â from encoding mismatch
-    text = text.replace("\u00a0", " ")   # Non-breaking space → regular space
-    text = text.replace("\u200b", "")    # Zero-width space
-    text = text.replace("\u200c", "")    # Zero-width non-joiner
-    text = text.replace("\u2019", "'")   # Right single quote → apostrophe
-    text = text.replace("\u2018", "'")   # Left single quote → apostrophe
-    text = text.replace("\u201c", '"')   # Left double quote
-    text = text.replace("\u201d", '"')   # Right double quote
-    text = re.sub(r" {2,}", " ", text)   # Collapse multiple spaces
+    """Strips unicode artefacts and normalises whitespace."""
+    text = text.replace("\u00c2", "")
+    text = text.replace("\u00a0", " ")
+    text = text.replace("\u200b", "")
+    text = text.replace("\u200c", "")
+    text = text.replace("\u2019", "'")
+    text = text.replace("\u2018", "'")
+    text = text.replace("\u201c", '"')
+    text = text.replace("\u201d", '"')
+    text = re.sub(r" {2,}", " ", text)
     return text.strip()
 
 
@@ -87,132 +75,102 @@ def is_see_also_heading(text: str) -> bool:
 
 
 # =============================================================================
-# SECTION 3: TABLE EXTRACTION HELPER
+# SECTION 3: TABLE HELPERS
+# NOTE: is_layout_table() and extract_table() are TWO SEPARATE top-level
+# functions. is_layout_table() must come first because extract_table()
+# does NOT call it — walk() calls both independently.
 # =============================================================================
-
-def extract_table(table_tag) -> dict:
-    """
-    Converts a BeautifulSoup <table> tag into a structured dict.
-
-    WHY A SEPARATE FUNCTION?
-        Tables have their own internal structure (thead, tbody, tr, th, td)
-        that doesn't fit the flat element list used for paragraphs and headings.
-        We extract the full 2D grid here and let the Word/TXT builders
-        render it appropriately for their format.
-
-    RETURNS:
-        {
-          'type': 'table',
-          'headers': ['Col1', 'Col2', ...],   # from <th> cells (may be empty list)
-          'rows': [['val1', 'val2'], ...],     # from <td> cells
-          'col_count': 4
-        }
-
-    HANDLES:
-        - Tables with <thead>/<tbody> structure
-        - Tables that use <th> inside <tbody> (first row as header)
-        - Merged cells (colspan) — cell content is repeated for each spanned column
-        - Nested content — extracts all text from inside each cell
-    """
 
 def is_layout_table(table_tag) -> bool:
     """
-    Returns True if a <table> is being used for page layout rather than data.
+    Returns True if a <table> is used for page layout rather than data.
 
-    WHY THIS MATTERS:
-        GE Vernova docs (and many older documentation sites) use <table> tags
-        for two completely different purposes:
-          1. DATA tables  — parameter lists, field definitions, comparison grids
-          2. LAYOUT tables — positioning an image next to text, multi-column layouts
+    Layout tables (image next to text, multi-column layouts) should be
+    walked normally so their text content is extracted as paragraphs.
 
-        Data tables should become Word tables.
-        Layout tables should be transparently walked — extract their text and
-        images as normal elements, ignoring the table structure entirely.
+    Data tables (parameter lists, field definitions) should become Word tables.
 
-    SIGNALS THAT IT IS A LAYOUT TABLE:
-        - Contains <img> tags directly inside cells
-        - Has no <th> header cells anywhere
-        - Has only 2-3 columns
-        - Cells contain long paragraphs (over 200 chars) — data cells are short
-        - Has a summary="" attribute (old HTML convention for layout tables)
+    SIGNALS OF A LAYOUT TABLE:
         - Has role="presentation" attribute
+        - Has summary="" attribute (old HTML convention)
+        - Contains any <img> tag inside its cells
+        - Has no <th> cells AND cells contain long paragraphs (avg > 200 chars)
     """
-    # Explicit HTML attributes that declare layout intent
+    # Explicit HTML attributes declaring layout intent
     if table_tag.get("role") == "presentation":
         return True
     if table_tag.get("summary") == "":
         return True
 
-    # If any cell directly contains an <img>, it's a layout table
-    # We still recurse into it via walk() so the surrounding text is captured
-    # Images themselves are skipped entirely — no embedding attempted
-    for img in table_tag.find_all("img"):
-        # Remove the img tags so they don't block text extraction
-        img.decompose()
+    # If any cell contains an image, it's a layout table
+    # We decompose() the img so it doesn't get double-processed
+    # when walk() recurses into the table's cells
+    imgs = table_tag.find_all("img")
+    if imgs:
+        for img in imgs:
+            img.decompose()
         return True
 
-    # If there are no <th> header cells at all, check cell content length
+    # No <th> cells + long cell content = layout table
     has_th = bool(table_tag.find("th"))
     if not has_th:
         cells = table_tag.find_all("td")
         if cells:
-            # Calculate average text length across all cells
-            avg_len = sum(
-                len(c.get_text(strip=True)) for c in cells
-            ) / len(cells)
-            # Data table cells are short (field names, values).
-            # Layout table cells contain full paragraphs.
+            avg_len = sum(len(c.get_text(strip=True)) for c in cells) / len(cells)
             if avg_len > 200:
                 return True
 
     return False
 
-    
-    
+
+def extract_table(table_tag) -> dict:
+    """
+    Converts a BeautifulSoup <table> tag into a structured dict.
+    Only called for DATA tables (after is_layout_table() returns False).
+
+    RETURNS:
+        {
+          'type': 'table',
+          'headers': ['Col1', 'Col2', ...],
+          'rows': [['val1', 'val2'], ...],
+          'col_count': 4
+        }
+    """
     headers = []
     rows    = []
 
-    # --- Extract header row from <thead> if it exists ---
+    # Extract header row from <thead> if it exists
     thead = table_tag.find("thead")
     if thead:
         for th in thead.find_all("th"):
-            # colspan tells us if this header spans multiple columns
-            colspan = int(th.get("colspan", 1))
+            colspan   = int(th.get("colspan", 1))
             cell_text = clean_text(th.get_text(separator=" ", strip=True))
-            # Repeat the header text for each column it spans
             headers.extend([cell_text] * colspan)
-
-        # Some tables put <td> in thead instead of <th>
         if not headers:
             for td in thead.find_all("td"):
-                colspan = int(td.get("colspan", 1))
+                colspan   = int(td.get("colspan", 1))
                 cell_text = clean_text(td.get_text(separator=" ", strip=True))
                 headers.extend([cell_text] * colspan)
 
-    # --- Extract data rows from <tbody> (or whole table if no tbody) ---
+    # Extract data rows from <tbody> (or whole table if no tbody)
     tbody = table_tag.find("tbody") or table_tag
 
     for tr in tbody.find_all("tr", recursive=False):
         cells = tr.find_all(["td", "th"])
         if not cells:
             continue
-
-        row = []
+        row    = []
+        all_th = all(c.name == "th" for c in cells)
         for cell in cells:
             colspan   = int(cell.get("colspan", 1))
             cell_text = clean_text(cell.get_text(separator=" ", strip=True))
-            row.extend([cell_text] * colspan)  # Expand spanned columns
-
-        # If this row looks like a header row (all <th> cells) and we
-        # haven't found headers yet, promote it to headers
-        all_th = all(c.name == "th" for c in cells)
+            row.extend([cell_text] * colspan)
         if all_th and not headers:
             headers = row
         else:
-            if any(cell for cell in row):  # Skip completely empty rows
+            if any(cell for cell in row):
                 rows.append(row)
 
-    # Determine column count from the widest row
     col_count = max(
         len(headers),
         max((len(r) for r in rows), default=0)
@@ -227,7 +185,7 @@ def is_layout_table(table_tag) -> bool:
 
 
 # =============================================================================
-# SECTION 4: IMAGE FETCH WITH WEBP SUPPORT
+# SECTION 4: CORE SCRAPING FUNCTION
 # =============================================================================
 
 BROWSER_HEADERS = {
@@ -235,90 +193,18 @@ BROWSER_HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection":      "keep-alive",
 }
-
-def fetch_image(src_url: str) -> tuple:
-    """
-    Downloads an image and returns (bytes, format_hint).
-    Converts WebP → PNG using Pillow so python-docx can embed it.
-    Returns (None, None) on any failure.
-
-    WHY PILLOW FOR WEBP?
-        python-docx uses the underlying python-docx image handler which
-        does not support WebP format. Pillow opens ANY image format it
-        knows (WebP, TIFF, BMP, etc.) and can re-save it as PNG in memory,
-        which python-docx handles perfectly.
-
-    RETURNS:
-        (image_bytes: bytes, hint: str)  where hint is 'png', 'jpeg', or 'skip'
-        (None, None) if download or conversion failed
-    """
-    # Skip SVG — it's a vector format, not a raster image.
-    # python-docx cannot embed SVGs at all.
-    if src_url.lower().endswith(".svg") or "svg" in src_url.lower().split("?")[0]:
-        return (None, "svg")
-
-    try:
-        resp = requests.get(src_url, headers=BROWSER_HEADERS,
-                            timeout=10, verify=False)
-        resp.raise_for_status()
-
-        content_type = resp.headers.get("Content-Type", "").lower()
-
-        # If it's not actually an image (e.g., the server returned HTML
-        # for a broken URL), skip it
-        if "image" not in content_type and not src_url.lower().split("?")[0].endswith(
-            (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff")
-        ):
-            return (None, None)
-
-        raw_bytes = resp.content
-
-        # --- WEBP / UNKNOWN FORMAT: run through Pillow → PNG ---
-        # We do this for WebP explicitly, and also as a fallback for any
-        # format python-docx might not recognise.
-        if "webp" in content_type or src_url.lower().endswith(".webp"):
-            try:
-                img = PilImage.open(io.BytesIO(raw_bytes)).convert("RGBA")
-                out = io.BytesIO()
-                img.save(out, format="PNG")
-                out.seek(0)
-                return (out.read(), "png")
-            except Exception:
-                return (None, None)
-
-        # --- STANDARD FORMATS (JPEG, PNG, GIF) ---
-        # Attempt a quick Pillow open to verify the bytes are a valid image
-        try:
-            PilImage.open(io.BytesIO(raw_bytes)).verify()
-        except Exception:
-            # Corrupt or unreadable image — skip silently
-            return (None, None)
-
-        return (raw_bytes, "ok")
-
-    except Exception:
-        return (None, None)
-
-
-# =============================================================================
-# SECTION 5: CORE SCRAPING FUNCTION
-# =============================================================================
 
 def scrape_page(url: str) -> dict:
     """
     Fetches a URL and returns a structured list of content elements.
-
-    Element types returned:
-        h1–h6   : heading with 'text'
-        p       : paragraph with 'text'
-        li      : list item with 'text' and 'list_type' ('ul'/'ol')
-        code    : code block with 'text'
-        blockquote : indented quote with 'text'
-        table   : full table dict from extract_table()
-        image   : image with 'src' and 'alt'
-        svg     : placeholder for SVG diagrams
+    Images are detected but NOT downloaded — only alt text is stored.
+    Tables are classified as layout or data before processing.
     """
     try:
         response = requests.get(url, headers=BROWSER_HEADERS,
@@ -332,7 +218,7 @@ def scrape_page(url: str) -> dict:
     title_tag  = soup.find("title")
     page_title = clean_text(title_tag.get_text(strip=True)) if title_tag else url
 
-    # --- Strip noise elements ---
+    # Strip noise elements
     noise_selectors = [
         "nav", "footer", "header", "aside",
         "script", "style",
@@ -349,7 +235,7 @@ def scrape_page(url: str) -> dict:
         for tag in soup.select(selector):
             tag.decompose()
 
-    # --- Find main content area ---
+    # Find main content area
     content_area = (
         soup.find("main")
         or soup.find("article")
@@ -365,7 +251,7 @@ def scrape_page(url: str) -> dict:
                 "error": "Could not find content area.", "elements": []}
 
     elements        = []
-    stop_extraction = False  # Flipped True when a "See Also" heading is hit
+    stop_extraction = False
 
     def walk(node):
         nonlocal stop_extraction
@@ -388,15 +274,13 @@ def scrape_page(url: str) -> dict:
                 if text:
                     elements.append({"type": tag_name, "text": text})
 
-           # ---- TABLES ----
+            # ---- TABLES ----
             elif tag_name == "table":
                 if is_layout_table(child):
-                    # Layout table — ignore the table structure entirely.
-                    # Recurse into it so images and text inside cells
-                    # are extracted as normal individual elements.
+                    # Layout table: ignore structure, walk cells for text
                     walk(child)
                 else:
-                    # Data table — convert to a structured Word table.
+                    # Data table: extract as structured grid
                     table_data = extract_table(child)
                     if table_data["rows"] or table_data["headers"]:
                         elements.append(table_data)
@@ -435,24 +319,16 @@ def scrape_page(url: str) -> dict:
                         elements.append({"type": "li", "text": text,
                                          "list_type": "ol"})
 
-            # ---- IMAGES ----
+            # ---- IMAGES — store alt text only, no download ----
             elif tag_name == "img":
-                src = child.get("src", "")
-                alt = clean_text(child.get("alt", "Image"))
-                if src:
-                    abs_src = urllib.parse.urljoin(url, src)
-                    # Flag SVGs separately so the builder can log a placeholder
-                    if abs_src.lower().endswith(".svg"):
-                        elements.append({"type": "svg", "alt": alt})
-                    else:
-                        elements.append({"type": "image",
-                                         "src": abs_src, "alt": alt})
+                alt = clean_text(child.get("alt", ""))
+                if alt and alt.lower() not in ("image", ""):
+                    elements.append({"type": "image", "alt": alt})
 
             # ---- RECURSE INTO CONTAINERS ----
             elif tag_name in ("div", "section", "main", "article", "figure",
                               "details", "summary"):
                 walk(child)
-            # Note: we no longer recurse into td/th — extract_table() handles those
 
     walk(content_area)
 
@@ -460,23 +336,11 @@ def scrape_page(url: str) -> dict:
 
 
 # =============================================================================
-# SECTION 6: WORD TABLE BUILDER HELPER
+# SECTION 5: WORD TABLE HELPER
 # =============================================================================
 
 def add_word_table(doc, table_data: dict):
-    """
-    Renders a table element dict as a proper python-docx Table.
-
-    HOW python-docx TABLES WORK:
-        doc.add_table(rows=N, cols=M) creates a grid.
-        table.cell(row_index, col_index) gives you a cell.
-        cell.text = "value" sets the cell content.
-        We then apply a built-in Word table style and shade the header row.
-
-    COLUMN WIDTH:
-        We divide the available page width (5.6 inches after margins) equally
-        among all columns. This keeps the table within the page margins.
-    """
+    """Renders a table dict as a real Word table with shaded header row."""
     headers   = table_data["headers"]
     rows      = table_data["rows"]
     col_count = table_data["col_count"]
@@ -490,76 +354,51 @@ def add_word_table(doc, table_data: dict):
     if total_rows == 0:
         return
 
-    # Create the table grid
-    table = doc.add_table(rows=total_rows, cols=col_count)
-
-    # Apply a clean built-in Word table style
-    # "Table Grid" gives solid borders on all cells — clean and readable
+    table       = doc.add_table(rows=total_rows, cols=col_count)
     table.style = "Table Grid"
 
-    # --- Fill header row ---
     if has_header_row:
         header_row = table.rows[0]
         for col_idx, header_text in enumerate(headers[:col_count]):
-            cell = header_row.cells[col_idx]
+            cell      = header_row.cells[col_idx]
             cell.text = header_text
-
-            # Make header text bold
             for paragraph in cell.paragraphs:
                 for run in paragraph.runs:
-                    run.bold = True
+                    run.bold      = True
                     run.font.size = Pt(10)
-
-            # Shade header cells with the same blue used in the GE Vernova table
-            # We do this by injecting the XML shading element directly
             tc   = cell._tc
             tcPr = tc.get_or_add_tcPr()
             shd  = OxmlElement("w:shd")
             shd.set(qn("w:val"),   "clear")
             shd.set(qn("w:color"), "auto")
-            shd.set(qn("w:fill"),  "D9E1F2")  # Light blue — matches GE docs style
+            shd.set(qn("w:fill"),  "D9E1F2")
             tcPr.append(shd)
 
-    # --- Fill data rows ---
     row_offset = 1 if has_header_row else 0
     for row_idx, row_data in enumerate(rows):
         word_row = table.rows[row_idx + row_offset]
         for col_idx, cell_text in enumerate(row_data[:col_count]):
-            cell = word_row.cells[col_idx]
+            cell      = word_row.cells[col_idx]
             cell.text = cell_text
             for paragraph in cell.paragraphs:
                 for run in paragraph.runs:
                     run.font.size = Pt(10)
 
-    # Add a blank paragraph after the table for visual spacing
     doc.add_paragraph()
 
 
 # =============================================================================
-# SECTION 7: PLAIN TEXT TABLE RENDERER
+# SECTION 6: PLAIN TEXT TABLE RENDERER
 # =============================================================================
 
 def render_text_table(table_data: dict) -> str:
     """
-    Renders a table as an ASCII grid for the plain text export.
+    Renders a table as a pipe-separated ASCII grid for plain text / AI export.
 
-    WHY ASCII TABLES FOR AI?
-        An AI reading plain text needs structure to understand relationships
-        between cells. A properly aligned ASCII table like:
-
-            | Order | Field Name | Required | Values         |
-            |-------|------------|----------|----------------|
-            | 0     | Result Set | X        | 5              |
-            | 1     | Prod Unit  | X        | PU_Id          |
-
-        is far more parseable than:
-            Order Field Name Required Values
-            0 Result Set X 5
-            1 Prod Unit X PU_Id
-
-        The pipe characters and dashes give the AI clear column boundaries,
-        which dramatically improves its ability to answer structured questions
-        like "which fields are required?" or "what does field 3 reference?"
+    Example output:
+        | Order | Field Name  | Required |
+        |-------|-------------|----------|
+        | 0     | Result Set  | X        |
     """
     headers   = table_data["headers"]
     rows      = table_data["rows"]
@@ -568,48 +407,33 @@ def render_text_table(table_data: dict) -> str:
     if col_count == 0:
         return ""
 
-    # Combine headers + rows into one list for width calculation
     all_rows = []
     if headers:
         all_rows.append(headers)
     all_rows.extend(rows)
-
-    # Pad every row to col_count columns (handle missing cells gracefully)
     all_rows = [row + [""] * (col_count - len(row)) for row in all_rows]
 
-    # Calculate the maximum width needed for each column
     col_widths = []
     for col_idx in range(col_count):
-        max_width = max(
-            len(str(row[col_idx])) for row in all_rows
-        ) if all_rows else 5
-        col_widths.append(max(max_width, 3))  # Minimum 3 chars wide
+        max_width = max(len(str(row[col_idx])) for row in all_rows) if all_rows else 5
+        col_widths.append(max(max_width, 3))
 
     def format_row(row):
-        """Formats one row as | cell | cell | cell |"""
-        cells = []
-        for col_idx, cell in enumerate(row[:col_count]):
-            # Left-align, pad to column width
-            cells.append(str(cell).ljust(col_widths[col_idx]))
+        cells = [str(row[i]).ljust(col_widths[i]) for i in range(col_count)]
         return "| " + " | ".join(cells) + " |"
 
     def separator_row():
-        """Creates the |---|---|---| divider line"""
         return "|-" + "-|-".join("-" * w for w in col_widths) + "-|"
 
     lines = []
-
     if headers:
         lines.append(format_row(headers))
         lines.append(separator_row())
         for row in rows:
-            padded = row + [""] * (col_count - len(row))
-            lines.append(format_row(padded))
+            lines.append(format_row(row + [""] * (col_count - len(row))))
     else:
-        # No header — just rows with a separator after the first
         for i, row in enumerate(rows):
-            padded = row + [""] * (col_count - len(row))
-            lines.append(format_row(padded))
+            lines.append(format_row(row + [""] * (col_count - len(row))))
             if i == 0:
                 lines.append(separator_row())
 
@@ -617,7 +441,7 @@ def render_text_table(table_data: dict) -> str:
 
 
 # =============================================================================
-# SECTION 8: WORD DOCUMENT BUILDER
+# SECTION 7: HYPERLINK HELPER
 # =============================================================================
 
 def add_hyperlink(paragraph, text: str, url: str):
@@ -630,13 +454,13 @@ def add_hyperlink(paragraph, text: str, url: str):
     )
     hyperlink = OxmlElement("w:hyperlink")
     hyperlink.set(qn("r:id"), r_id)
-    run = OxmlElement("w:r")
-    rPr = OxmlElement("w:rPr")
+    run  = OxmlElement("w:r")
+    rPr  = OxmlElement("w:rPr")
     rStyle = OxmlElement("w:rStyle")
     rStyle.set(qn("w:val"), "Hyperlink")
     rPr.append(rStyle)
     run.append(rPr)
-    t = OxmlElement("w:t")
+    t      = OxmlElement("w:t")
     t.text = text
     run.append(t)
     hyperlink.append(run)
@@ -644,11 +468,12 @@ def add_hyperlink(paragraph, text: str, url: str):
     return hyperlink
 
 
+# =============================================================================
+# SECTION 8: WORD DOCUMENT BUILDER
+# =============================================================================
+
 def build_word_document(pages: list, doc_title: str) -> io.BytesIO:
-    """
-    Assembles all scraped pages into a formatted Word .docx file.
-    v3: adds real table rendering and WebP image support.
-    """
+    """Assembles all scraped pages into a formatted Word .docx file."""
     doc = Document()
 
     for section in doc.sections:
@@ -657,22 +482,22 @@ def build_word_document(pages: list, doc_title: str) -> io.BytesIO:
         section.left_margin   = Inches(1.2)
         section.right_margin  = Inches(1.2)
 
-    normal_style = doc.styles["Normal"]
+    normal_style           = doc.styles["Normal"]
     normal_style.font.name = "Calibri"
     normal_style.font.size = Pt(11)
 
     # Cover title
-    title_para = doc.add_paragraph()
+    title_para           = doc.add_paragraph()
     title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title_para.add_run(doc_title)
-    run.bold = True
-    run.font.size = Pt(26)
-    run.font.color.rgb = RGBColor(0x1a, 0x1a, 0x2e)
+    run                  = title_para.add_run(doc_title)
+    run.bold             = True
+    run.font.size        = Pt(26)
+    run.font.color.rgb   = RGBColor(0x1a, 0x1a, 0x2e)
     title_para.space_after = Pt(6)
 
-    sub = doc.add_paragraph("Compiled Documentation")
-    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    sub.runs[0].font.size = Pt(12)
+    sub                      = doc.add_paragraph("Compiled Documentation")
+    sub.alignment            = WD_ALIGN_PARAGRAPH.CENTER
+    sub.runs[0].font.size    = Pt(12)
     sub.runs[0].font.color.rgb = RGBColor(0x55, 0x55, 0x55)
     doc.add_paragraph()
 
@@ -684,15 +509,15 @@ def build_word_document(pages: list, doc_title: str) -> io.BytesIO:
         if page_heading.runs:
             page_heading.runs[0].font.color.rgb = RGBColor(0x00, 0x72, 0xC6)
 
-        source_para = doc.add_paragraph("Source: ")
-        source_para.runs[0].font.size = Pt(9)
-        source_para.runs[0].italic = True
+        source_para                    = doc.add_paragraph("Source: ")
+        source_para.runs[0].font.size  = Pt(9)
+        source_para.runs[0].italic     = True
         source_para.runs[0].font.color.rgb = RGBColor(0x55, 0x55, 0x55)
         add_hyperlink(source_para, page["url"], page["url"])
         doc.add_paragraph()
 
         if "error" in page and not page.get("elements"):
-            err_para = doc.add_paragraph(f"⚠ Could not retrieve content: {page['error']}")
+            err_para = doc.add_paragraph(f"Could not retrieve content: {page['error']}")
             if err_para.runs:
                 err_para.runs[0].font.color.rgb = RGBColor(0xFF, 0x00, 0x00)
             continue
@@ -702,15 +527,14 @@ def build_word_document(pages: list, doc_title: str) -> io.BytesIO:
 
             # ---- HEADINGS ----
             if etype in ("h1", "h2", "h3", "h4", "h5", "h6"):
-                level_num  = int(etype[1])
-                word_level = min(level_num + 1, 9)
+                word_level = min(int(etype[1]) + 1, 9)
                 doc.add_heading(elem["text"], level=word_level)
 
             # ---- PARAGRAPHS ----
             elif etype == "p":
                 doc.add_paragraph(elem["text"])
 
-            # ---- TABLES (NEW IN v3) ----
+            # ---- TABLES ----
             elif etype == "table":
                 add_word_table(doc, elem)
 
@@ -735,24 +559,15 @@ def build_word_document(pages: list, doc_title: str) -> io.BytesIO:
                          else "List Bullet")
                 doc.add_paragraph(elem["text"], style=style)
 
-            # ---- IMAGES — skipped for stability ----
-            # Image embedding causes layout tables to lose surrounding content.
-            # Images are logged as placeholder text only.
+            # ---- IMAGES — alt text label only, no download ----
             elif etype == "image":
-                if elem.get("alt") and elem["alt"] not in ("Image", ""):
-                    note = doc.add_paragraph(f"[Image: {elem['alt']}]")
+                alt = elem.get("alt", "")
+                if alt:
+                    note = doc.add_paragraph(f"[Image: {alt}]")
                     if note.runs:
-                        note.runs[0].italic = True
+                        note.runs[0].italic    = True
                         note.runs[0].font.size = Pt(9)
                         note.runs[0].font.color.rgb = RGBColor(0x88, 0x88, 0x88)
-
-            # ---- SVG PLACEHOLDER (NEW IN v3) ----
-            elif etype == "svg":
-                alt_text = elem.get("alt", "Diagram")
-                svg_para = doc.add_paragraph(f"[SVG Diagram: {alt_text}]")
-                if svg_para.runs:
-                    svg_para.runs[0].italic = True
-                    svg_para.runs[0].font.color.rgb = RGBColor(0x88, 0x88, 0x88)
 
     buffer = io.BytesIO()
     doc.save(buffer)
@@ -765,10 +580,7 @@ def build_word_document(pages: list, doc_title: str) -> io.BytesIO:
 # =============================================================================
 
 def build_plain_text(pages: list, doc_title: str) -> io.BytesIO:
-    """
-    Converts scraped pages into clean plain text optimised for AI input.
-    v3: tables rendered as ASCII grids; SVG logged as placeholder.
-    """
+    """Converts scraped pages into clean plain text optimised for AI input."""
     lines = []
     lines.append("=" * 60)
     lines.append(doc_title.upper())
@@ -815,33 +627,25 @@ def build_plain_text(pages: list, doc_title: str) -> io.BytesIO:
             elif etype == "blockquote":
                 lines.append(f'  "{elem["text"]}"')
                 lines.append("")
-
-            # ---- TABLE: render as ASCII grid (NEW IN v3) ----
             elif etype == "table":
                 ascii_table = render_text_table(elem)
                 if ascii_table:
                     lines.append(ascii_table)
                     lines.append("")
-
-            # ---- IMAGE: alt text note ----
             elif etype == "image":
-                if elem.get("alt") and elem["alt"] != "Image":
-                    lines.append(f"[IMAGE: {elem['alt']}]")
-
-            # ---- SVG: placeholder (NEW IN v3) ----
-            elif etype == "svg":
-                lines.append(f"[SVG DIAGRAM: {elem.get('alt', 'see source page')}]")
+                alt = elem.get("alt", "")
+                if alt:
+                    lines.append(f"[IMAGE: {alt}]")
 
         lines.append("")
 
-    full_text = "\n".join(lines)
-    buffer    = io.BytesIO(full_text.encode("utf-8"))
+    buffer = io.BytesIO("\n".join(lines).encode("utf-8"))
     buffer.seek(0)
     return buffer
 
 
 # =============================================================================
-# SECTION 10: STREAMLIT USER INTERFACE
+# SECTION 10: STREAMLIT UI
 # =============================================================================
 
 col_left, col_right = st.columns([2, 1])
@@ -870,37 +674,34 @@ with col_left:
             "📄 Export as Word (.docx)",
             type="primary",
             use_container_width=True,
-            help="Formatted document with real tables, headings, bullets, and images.",
         )
     with btn_col2:
         txt_button = st.button(
             "🤖 Export as Plain Text (.txt)",
             type="secondary",
             use_container_width=True,
-            help="Clean text with ASCII tables. Optimised for AI tools.",
         )
 
 with col_right:
     st.subheader("ℹ How it works")
     st.info(
-        "**📄 Word export** — real tables with shaded headers, "
-        "embedded images (PNG/JPEG/WebP), headings, bullets.\n\n"
-        "**🤖 Plain Text export** — tables as aligned ASCII grids "
-        "(pipe-separated columns), images as alt-text notes. "
-        "Ideal for ChatGPT, Claude, or Gemini.\n\n"
+        "**📄 Word** — real tables with shaded headers, "
+        "headings, bullets. Images shown as labels.\n\n"
+        "**🤖 Plain Text** — pipe-separated ASCII tables, "
+        "markdown headings. Best for AI tools.\n\n"
         "---\n"
-        "**Filtered out automatically:**\n"
+        "**Filtered out:**\n"
         "- Navigation menus & sidebars\n"
         "- 'See Also' / 'Related Topics' sections\n"
         "- Cookie banners & footers\n"
-        "- Unicode artefacts (stray Â characters)\n"
-        "- SVG images (shown as placeholder label)"
+        "- Unicode artefacts (stray  characters)\n"
+        "- Layout tables (image+text side-by-side)"
     )
 
 st.divider()
 
 # =============================================================================
-# SECTION 11: SHARED SCRAPING + EXPORT LOGIC
+# SECTION 11: SCRAPING + EXPORT LOGIC
 # =============================================================================
 
 compile_triggered = word_button or txt_button
@@ -909,7 +710,7 @@ export_mode       = "word" if word_button else "txt"
 if compile_triggered:
 
     if not url_input.strip():
-        st.error("Please enter at least one URL before exporting.")
+        st.error("Please enter at least one URL.")
         st.stop()
 
     raw_urls   = [line.strip() for line in url_input.strip().splitlines()]
@@ -931,9 +732,8 @@ if compile_triggered:
 
     with st.status("Scraping pages…", expanded=True) as status_box:
         for idx, url in enumerate(valid_urls):
-            fraction = idx / len(valid_urls)
             progress_bar.progress(
-                fraction,
+                idx / len(valid_urls),
                 text=f"Scraping {idx + 1} of {len(valid_urls)}: {url}"
             )
             st.write(f"🔍 Fetching: `{url}`")
@@ -943,53 +743,39 @@ if compile_triggered:
             if "error" in result and not result.get("elements"):
                 st.write(f"  ⚠ Error: {result['error']}")
             else:
-                elem_count   = len(result.get("elements", []))
-                table_count  = sum(1 for e in result.get("elements", [])
-                                   if e["type"] == "table")
-                image_count  = sum(1 for e in result.get("elements", [])
-                                   if e["type"] == "image")
-                st.write(
-                    f"  ✅ Done — {elem_count} elements "
-                    f"({table_count} table(s), {image_count} image(s))"
-                )
+                elem_count  = len(result.get("elements", []))
+                table_count = sum(1 for e in result.get("elements", [])
+                                  if e["type"] == "table")
+                st.write(f"  ✅ Done — {elem_count} elements ({table_count} table(s))")
 
         progress_bar.progress(1.0, text="Scraping complete. Building output…")
-        status_box.update(label="Scraping complete!", state="complete",
-                          expanded=False)
+        status_box.update(label="Scraping complete!", state="complete", expanded=False)
 
     safe_filename = (
-        doc_title_input.strip().replace(" ", "_").replace("/", "-")
-        or "documentation"
+        doc_title_input.strip().replace(" ", "_").replace("/", "-") or "documentation"
     )
 
-    # --- WORD EXPORT ---
     if export_mode == "word":
-        with st.spinner("Assembling Word document (fetching images…)"):
+        with st.spinner("Assembling Word document…"):
             docx_buffer = build_word_document(scraped_pages, doc_title_input)
-
         st.success(f"✅ Word document compiled from {len(valid_urls)} page(s)!")
         st.download_button(
             label="⬇ Download Word Document (.docx)",
             data=docx_buffer,
             file_name=f"{safe_filename}.docx",
-            mime=(
-                "application/vnd.openxmlformats-officedocument"
-                ".wordprocessingml.document"
-            ),
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
         )
 
-    # --- PLAIN TEXT EXPORT ---
     elif export_mode == "txt":
         with st.spinner("Assembling plain text file…"):
             txt_buffer = build_plain_text(scraped_pages, doc_title_input)
-
-        st.success(f"✅ Plain text file compiled from {len(valid_urls)} page(s)!")
+        st.success(f"✅ Plain text compiled from {len(valid_urls)} page(s)!")
 
         txt_buffer.seek(0)
-        preview_text  = txt_buffer.read().decode("utf-8")
-        preview_lines = "\n".join(preview_text.splitlines()[:60])
-
+        preview_lines = "\n".join(
+            txt_buffer.read().decode("utf-8").splitlines()[:60]
+        )
         with st.expander("👁 Preview first 60 lines"):
             st.code(preview_lines, language=None)
 
@@ -1002,8 +788,6 @@ if compile_triggered:
             use_container_width=True,
         )
         st.info(
-            "💡 **AI tip:** Open the .txt file, press `Ctrl+A` → `Ctrl+C`, "
-            "then paste it into your AI chat with your question. "
-            "The pipe-separated tables give the AI clear column boundaries "
-            "so it can accurately answer questions about parameters and values."
+            "💡 **AI tip:** Open the .txt, press `Ctrl+A` → `Ctrl+C`, "
+            "paste into your AI chat alongside your question."
         )
